@@ -35,6 +35,7 @@ GATT_DATA(const uint16_t bg_gattdb_data_uuidtable_16_map[]) =
   0x2add,
   0x2ade,
   0x2902,
+  0x2B05
 };
 
 GATT_DATA(const uint8_t bg_gattdb_data_uuidtable_128_map[]) =

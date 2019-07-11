@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <projectDescription>
-	<name>soc-btmesh-light</name>
+	<name>soc-btmesh-switch</name>
 	<comment></comment>
 	<projects>
 	</projects>
@@ -239,6 +239,11 @@
 			<name>kit_lcd/BRD4104A/display.c</name>
 			<type>1</type>
 			<locationURI>STUDIO_SDK_LOC/hardware/kit/common/drivers/display.c</locationURI>
+		</link>
+		<link>
+			<name>kit_lcd/BRD4104A/displayls013b7dh03.c</name>
+			<type>1</type>
+			<locationURI>STUDIO_SDK_LOC/hardware/kit/common/drivers/displayls013b7dh03.c</locationURI>
 		</link>
 		<link>
 			<name>kit_lcd/BRD4104A/displaypalemlib.c</name>

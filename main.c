@@ -1,8 +1,8 @@
 /***********************************************************************************************//**
  * \file   main.c
- * \brief  Silicon Labs Bluetooth mesh light example
+ * \brief  Silicon Labs Bluetooth mesh light switch example
  *
- * This example implements a Bluetooth mesh light node.
+ * This example implements a Bluetooth mesh light switch.
  *
  ***************************************************************************************************
  * <b> (C) Copyright 2017 Silicon Labs, http://www.silabs.com</b>
@@ -35,8 +35,9 @@
 #include "mx25flash_spi.h"
 #endif /* FEATURE_SPI_FLASH */
 
-/* emLib (HW drivers) specific includes */
+/* emLib and emDrv (HW drivers) specific includes */
 #include <em_gpio.h>
+#include <gpiointerrupt.h>
 
 /* Bluetooth LE stack includes */
 #include <native_gecko.h>
@@ -47,18 +48,12 @@
 
 /* Bluetooth mesh stack includes */
 #include "gecko_bgapi_mesh_node_native.h"
+#include "gecko_bgapi_mesh_generic_client_native.h"
 #include "mesh_generic_model_capi_types.h"
-#include "gecko_bgapi_mesh_generic_server_native.h"
 #include "mesh_lib.h"
 
 /* EFR32 hardware initialization */
 #include "InitDevice.h"
-
-#include "em_timer.h"
-#include "em_cmu.h"
-
-
-struct mesh_generic_state current, target;
 
 // Maximum number of simultaneous Bluetooth connections
 #define MAX_CONNECTIONS 2
@@ -94,7 +89,7 @@ const gecko_configuration_t config =
 #define TIMER_ID_RESTART    78
 #define TIMER_ID_FACTORY_RESET  77
 #define TIMER_ID_PROVISIONING   66
-#define TIMER_ID_TRANSITION   55
+#define TIMER_ID_RETRANS    10
 
 /**
  *  LCD content can be updated one row at a time using function LCD_write().
@@ -102,49 +97,21 @@ const gecko_configuration_t config =
  */
 #define LCD_ROW_NAME     1  /* 1st row, device name */
 #define LCD_ROW_STATUS     2    /* 2nd row, node status */
-#define LCD_ROW_CONNECTION 3/* 3rd row, connection status */
-#define LCD_ROW_AUTH_CODE  4
-#define LED_STATUS         5
-#define LILYPAD_STATUS     6
-#define LCD_ROW_MAX        6    /* total number of rows used */
+#define LCD_ROW_CONNECTION 3    /* 3rd row, connection status */
+#define LCD_ROW_AUTH_CODE 4
+#define LCD_ROW_MAX        4    /* total number of rows used */
 
 #define LCD_ROW_LEN        32   /* up to 32 characters per each row */
 
 /** global variables */
 static uint16 _my_index = 0xffff; /* Index of the Primary Element of the Node */
 static uint16 _my_address = 0;    /* Address of the Primary Element of the Node */
+static uint8 switch_pos = 0;      /* current position of the switch  */
+static uint8 request_count;       /* number of on/off requests to be sent */
+static uint8 trid = 0;        /* transaction identifier */
 static char LCD_data[LCD_ROW_MAX][LCD_ROW_LEN];   /* 2D array for storing the LCD content */
 static uint8 num_connections = 0;     /* number of active Bluetooth connections */
 static uint8 conn_handle = 0xFF;      /* handle of the last opened LE connection */
-
-#define RED_BLINK  1
-#define GREEN_BLINK 2
-#define BLUE_BLINK 3
-#define GLOW_HUN 1
-#define GLOW_SEV 2
-#define GLOW_FIF 3
-#define GLOW_TWE 4
-#define GLOW_LESS 5
-#define NO_GLOW 6
-/*Authentication code data*/
-
-char temp[10];
-   uint16 Auth_code;
-int8 state_led=1;
-
-uint8 previous_data=1;
-
-static struct lightbulb_state {
-  // On/Off Server state
-  uint8_t onoff_current;
-  uint8_t onoff_target;
-
-  // Transition Time Server state
-  uint8_t transtime;
-
-  // On Power Up Server state
-  uint8_t onpowerup;
-} lightbulb_state;
 
 /**
  *  State of the LEDs is updated by calling LED_set_state().
@@ -152,7 +119,6 @@ static struct lightbulb_state {
  */
 #define LED_STATE_OFF    0   /* light off (both LEDs turned off)   */
 #define LED_STATE_ON     1   /* light on (both LEDs turned on)     */
-#define LED_STATE_TRANS  2   /* transition (LED0 on, LED1 off)     */
 #define LED_STATE_PROV   3   /* provisioning (LEDs blinking)       */
 
 /**
@@ -171,15 +137,11 @@ static struct lightbulb_state {
 #define LED_DEFAULT_STATE  0
 #endif
 
-/*Pins for Lilypad LED*/
-uint8 temp_value=0;
-#define RED_LED (gpioPortD)
-#define GREEN_LED (gpioPortD)
-#define BLUE_LED (gpioPortD)
 
-#define RED_LED_PIN 10
-#define GREEN_LED_PIN 11
-#define BLUE_LED_PIN 12
+/*Authentication code data*/
+
+char temp[10];
+   uint16 Auth_code;
 
 /**
  * Update the state of LEDs. Takes one parameter LED_STATE_xxx that defines
@@ -191,37 +153,14 @@ static void LED_set_state(int state)
     case LED_STATE_OFF:
       TURN_LED_OFF(BSP_GPIO_LED0_PORT, BSP_GPIO_LED0_PIN);
       TURN_LED_OFF(BSP_GPIO_LED1_PORT, BSP_GPIO_LED1_PIN);
-
-LCD_write("LED is OFF",LED_STATUS);
-//GPIO_PinOutSet(BLUE_LED,BLUE_LED_PIN);
-//GPIO_PinOutSet(RED_LED,RED_LED_PIN);
-//GPIO_PinOutSet(GREEN_LED,GREEN_LED_PIN);
-
-
-//      TIMER0->CMD = TIMER_CMD_START;
-//      TIMER_CompareBufSet(TIMER0, 2, 1);
       break;
-
     case LED_STATE_ON:
       TURN_LED_ON(BSP_GPIO_LED0_PORT, BSP_GPIO_LED0_PIN);
       TURN_LED_ON(BSP_GPIO_LED1_PORT, BSP_GPIO_LED1_PIN);
-      LCD_write("LED is ON",LED_STATUS);
-
-
-     	  //TIMER_CompareBufSet(TIMER0, 2, 1);
-      break;
-
-    case LED_STATE_TRANS:
-      TURN_LED_OFF(BSP_GPIO_LED0_PORT, BSP_GPIO_LED0_PIN);
-      TURN_LED_ON(BSP_GPIO_LED1_PORT, BSP_GPIO_LED1_PIN);
-
-
       break;
     case LED_STATE_PROV:
       GPIO_PinOutToggle(BSP_GPIO_LED0_PORT, BSP_GPIO_LED0_PIN);
       GPIO_PinOutToggle(BSP_GPIO_LED1_PORT, BSP_GPIO_LED1_PIN);
-
-
       break;
 
     default:
@@ -257,660 +196,143 @@ static void LNA_init(void)
 }
 #endif
 
-static int lightbulb_state_load(void);
-static int lightbulb_state_store(void);
-
-static uint32_t default_transition_time(void)
-{
-  return mesh_lib_transition_time_to_ms(lightbulb_state.transtime);
-}
-
-static errorcode_t onoff_response(uint16_t element_index,
-                                  uint16_t client_addr,
-                                  uint16_t appkey_index)
-{
-  struct mesh_generic_state current, target;
-
-  current.kind = mesh_generic_state_on_off;
-  current.on_off.on = lightbulb_state.onoff_current;
-
-  target.kind = mesh_generic_state_on_off;
-  target.on_off.on = lightbulb_state.onoff_target;
-
-  return mesh_lib_generic_server_response(MESH_GENERIC_ON_OFF_SERVER_MODEL_ID,
-                                          element_index,
-                                          client_addr,
-                                          appkey_index,
-                                          &current,
-                                          NULL,
-                                          0,
-                                          0x00);
-}
-
-static errorcode_t onoff_update(uint16_t element_index)
-{
-  struct mesh_generic_state current, target;
-
-  current.kind = mesh_generic_state_on_off;
-  current.on_off.on = lightbulb_state.onoff_current;
-
-  target.kind = mesh_generic_state_on_off;
-  target.on_off.on = lightbulb_state.onoff_target;
-
-  return mesh_lib_generic_server_update(MESH_GENERIC_ON_OFF_SERVER_MODEL_ID,
-                                        element_index,
-                                        &current,
-                                        NULL,
-                                        0);
-}
-
-static errorcode_t onoff_update_and_publish(uint16_t element_index)
-{
-  errorcode_t e;
-
-  e = onoff_update(element_index);
-  if (e == bg_err_success) {
-    e = mesh_lib_generic_server_publish(MESH_GENERIC_ON_OFF_SERVER_MODEL_ID,
-                                        element_index,
-                                        mesh_generic_state_on_off);
-  }
-
-  return e;
-}
-
-static void onoff_request(uint16_t model_id,
-                          uint16_t element_index,
-                          uint16_t client_addr,
-                          uint16_t server_addr,
-                          uint16_t appkey_index,
-                          const struct mesh_generic_request *request,
-                          uint32_t transition_ms,
-                          uint16_t delay_ms,
-                          uint8_t request_flags)
-{
-  printf("ON/OFF request: requested state=<%s>, transition=%u, delay=%u\r\n",
-         request->on_off ? "ON" : "OFF", transition_ms, delay_ms);
-if(request->on_off==1)
-{
-	//CMU_ClockEnable(cmuClock_TIMER0, false);
-	TIMER0->CMD = TIMER_CMD_STOP;
-	GPIO_PinOutSet(BLUE_LED,BLUE_LED_PIN);
-GPIO_PinOutSet(GREEN_LED,GREEN_LED_PIN);
-GPIO_PinOutSet(RED_LED,RED_LED_PIN);
-	switch(state_led)
-	{
-	case RED_BLINK:
-		TIMER0->ROUTEPEN = ~(TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN);
-		GPIO_PinOutSet(BLUE_LED,BLUE_LED_PIN);
-	    GPIO_PinOutSet(GREEN_LED,GREEN_LED_PIN);
-		GPIO_PinOutSet(RED_LED,RED_LED_PIN);
-	   GPIO_PinOutClear(RED_LED,RED_LED_PIN);
-     LCD_write("LilyPad LED RED ON",LILYPAD_STATUS);
-	    	 state_led=2;
-	    break;
-
-	case GREEN_BLINK:
-
-		TIMER0->ROUTEPEN = ~(TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN);
-		 GPIO_PinOutSet(RED_LED,RED_LED_PIN);
-		GPIO_PinOutSet(BLUE_LED,BLUE_LED_PIN);
-		GPIO_PinOutSet(GREEN_LED,GREEN_LED_PIN);
-	      GPIO_PinOutClear(GREEN_LED,GREEN_LED_PIN);
-	      LCD_write("LilyPad LED GREEN ON",LILYPAD_STATUS);
-	      state_led=3;
-	      break;
-
-	case BLUE_BLINK:
-		TIMER0->ROUTEPEN = ~(TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN);
-		 GPIO_PinOutSet(GREEN_LED,GREEN_LED_PIN);
-		 GPIO_PinOutSet(RED_LED,RED_LED_PIN);
-		GPIO_PinOutSet(BLUE_LED,BLUE_LED_PIN);
-	    	 GPIO_PinOutClear(BLUE_LED,BLUE_LED_PIN);
-	    	 LCD_write("LilyPad LED BLUE ON",LILYPAD_STATUS);
-	    	 state_led=1;
-	    	 break;
-	     }
-
-}
-
-if(request->on_off == 0)
-{
-	CMU_ClockEnable(cmuClock_TIMER0, true);
-	if(state_led==2)
-	{
-	switch(previous_data)
-	{
-	case GLOW_HUN:
-		CMU_ClockEnable(cmuClock_TIMER0, true);
-		CMU_ClockEnable(cmuClock_GPIO, true);
-         	TIMER0->CMD = TIMER_CMD_STOP;
-		    TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC16);
-		      // Route CC2 to location 1 (PE3) and enable pin for cc2
-		      TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-		      TIMER_CompareBufSet(TIMER0, 2, 1);
-		      TIMER0->CMD = TIMER_CMD_START;
-              previous_data=2;
-              break;
-
-	case GLOW_SEV:
-		CMU_ClockEnable(cmuClock_TIMER0, true);
-		CMU_ClockEnable(cmuClock_GPIO, true);
-		TIMER0->CMD = TIMER_CMD_STOP;
-		TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC16);
-		// Route CC2 to location 1 (PE3) and enable pin for cc2
-		TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-		TIMER_CompareBufSet(TIMER0, 2, 25);
-		TIMER0->CMD = TIMER_CMD_START;
-		previous_data=3;
-		    break;
-
-	case GLOW_FIF:
-		CMU_ClockEnable(cmuClock_TIMER0, true);
-		CMU_ClockEnable(cmuClock_GPIO, true);
-			TIMER0->CMD = TIMER_CMD_STOP;
-			TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC16);
-			// Route CC2 to location 1 (PE3) and enable pin for cc2
-			TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-			TIMER_CompareBufSet(TIMER0, 2, 50);
-			TIMER0->CMD = TIMER_CMD_START;
-			previous_data=4;
-			    break;
-	case GLOW_TWE:
-		CMU_ClockEnable(cmuClock_TIMER0, true);
-		CMU_ClockEnable(cmuClock_GPIO, true);
-				TIMER0->CMD = TIMER_CMD_STOP;
-				TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC16);
-				// Route CC2 to location 1 (PE3) and enable pin for cc2
-				TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-				TIMER_CompareBufSet(TIMER0, 2, 75);
-				TIMER0->CMD = TIMER_CMD_START;
-				previous_data=5;
-				    break;
-	case GLOW_LESS:
-		CMU_ClockEnable(cmuClock_TIMER0, true);
-		CMU_ClockEnable(cmuClock_GPIO, true);
-				TIMER0->CMD = TIMER_CMD_STOP;
-				TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC16);
-				// Route CC2 to location 1 (PE3) and enable pin for cc2
-				TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-				TIMER_CompareBufSet(TIMER0, 2, 99);
-				TIMER0->CMD = TIMER_CMD_START;
-				previous_data=6;
-				    break;
-	case NO_GLOW:
-		CMU_ClockEnable(cmuClock_TIMER0, true);
-		CMU_ClockEnable(cmuClock_GPIO, true);
-						TIMER0->CMD = TIMER_CMD_STOP;
-						TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC16);
-						// Route CC2 to location 1 (PE3) and enable pin for cc2
-						TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-						TIMER_CompareBufSet(TIMER0, 2, 100);
-						TIMER0->CMD = TIMER_CMD_START;
-						previous_data=1;
-						    break;
-
-	}
-	}
-	if(state_led==3)
-	{
-	switch(previous_data)
-	{
-	case GLOW_HUN:
-		CMU_ClockEnable(cmuClock_TIMER0, true);
-		CMU_ClockEnable(cmuClock_GPIO, true);
-         	TIMER0->CMD = TIMER_CMD_STOP;
-		    TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC17);
-		      // Route CC2 to location 1 (PE3) and enable pin for cc2
-		      TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-		      TIMER_CompareBufSet(TIMER0, 2, 1);
-		      TIMER0->CMD = TIMER_CMD_START;
-              previous_data=2;
-              break;
-
-	case GLOW_SEV:
-		CMU_ClockEnable(cmuClock_TIMER0, true);
-		CMU_ClockEnable(cmuClock_GPIO, true);
-		TIMER0->CMD = TIMER_CMD_STOP;
-		TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC17);
-		// Route CC2 to location 1 (PE3) and enable pin for cc2
-		TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-		TIMER_CompareBufSet(TIMER0, 2, 25);
-		TIMER0->CMD = TIMER_CMD_START;
-		previous_data=3;
-		    break;
-
-	case GLOW_FIF:
-		CMU_ClockEnable(cmuClock_TIMER0, true);
-		CMU_ClockEnable(cmuClock_GPIO, true);
-			TIMER0->CMD = TIMER_CMD_STOP;
-			TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC17);
-			// Route CC2 to location 1 (PE3) and enable pin for cc2
-			TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-			TIMER_CompareBufSet(TIMER0, 2, 50);
-			TIMER0->CMD = TIMER_CMD_START;
-			previous_data=4;
-			    break;
-	case GLOW_TWE:
-		CMU_ClockEnable(cmuClock_TIMER0, true);
-		CMU_ClockEnable(cmuClock_GPIO, true);
-				TIMER0->CMD = TIMER_CMD_STOP;
-				TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC17);
-				// Route CC2 to location 1 (PE3) and enable pin for cc2
-				TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-				TIMER_CompareBufSet(TIMER0, 2, 75);
-				TIMER0->CMD = TIMER_CMD_START;
-				previous_data=5;
-				    break;
-	case GLOW_LESS:
-		CMU_ClockEnable(cmuClock_TIMER0, true);
-		CMU_ClockEnable(cmuClock_GPIO, true);
-				TIMER0->CMD = TIMER_CMD_STOP;
-				TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC17);
-				// Route CC2 to location 1 (PE3) and enable pin for cc2
-				TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-				TIMER_CompareBufSet(TIMER0, 2, 98);
-				TIMER0->CMD = TIMER_CMD_START;
-				previous_data=6;
-				    break;
-
-	case NO_GLOW:
-			CMU_ClockEnable(cmuClock_TIMER0, true);
-			CMU_ClockEnable(cmuClock_GPIO, true);
-							TIMER0->CMD = TIMER_CMD_STOP;
-							TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC16);
-							// Route CC2 to location 1 (PE3) and enable pin for cc2
-							TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-							TIMER_CompareBufSet(TIMER0, 2, 100);
-							TIMER0->CMD = TIMER_CMD_START;
-							previous_data=1;
-							    break;
-	}
-	}
-
-	if(state_led==1)
-	{
-	switch(previous_data)
-	{
-	case GLOW_HUN:
-		CMU_ClockEnable(cmuClock_TIMER0, true);
-		CMU_ClockEnable(cmuClock_GPIO, true);
-         	TIMER0->CMD = TIMER_CMD_STOP;
-		    TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC18);
-		      // Route CC2 to location 1 (PE3) and enable pin for cc2
-		      TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-		      TIMER_CompareBufSet(TIMER0, 2, 1);
-		      TIMER0->CMD = TIMER_CMD_START;
-              previous_data=2;
-              break;
-
-	case GLOW_SEV:
-		CMU_ClockEnable(cmuClock_TIMER0, true);
-		CMU_ClockEnable(cmuClock_GPIO, true);
-		TIMER0->CMD = TIMER_CMD_STOP;
-		TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC18);
-		// Route CC2 to location 1 (PE3) and enable pin for cc2
-		TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-		TIMER_CompareBufSet(TIMER0, 2, 25);
-		TIMER0->CMD = TIMER_CMD_START;
-		previous_data=3;
-		    break;
-
-	case GLOW_FIF:
-		CMU_ClockEnable(cmuClock_TIMER0, true);
-		CMU_ClockEnable(cmuClock_GPIO, true);
-			TIMER0->CMD = TIMER_CMD_STOP;
-			TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC18);
-			// Route CC2 to location 1 (PE3) and enable pin for cc2
-			TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-			TIMER_CompareBufSet(TIMER0, 2, 50);
-			TIMER0->CMD = TIMER_CMD_START;
-			previous_data=4;
-			    break;
-	case GLOW_TWE:
-		CMU_ClockEnable(cmuClock_TIMER0, true);
-		CMU_ClockEnable(cmuClock_GPIO, true);
-				TIMER0->CMD = TIMER_CMD_STOP;
-				TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC18);
-				// Route CC2 to location 1 (PE3) and enable pin for cc2
-				TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-				TIMER_CompareBufSet(TIMER0, 2, 75);
-				TIMER0->CMD = TIMER_CMD_START;
-				previous_data=5;
-				    break;
-	case GLOW_LESS:
-		CMU_ClockEnable(cmuClock_TIMER0, true);
-		CMU_ClockEnable(cmuClock_GPIO, true);
-				TIMER0->CMD = TIMER_CMD_STOP;
-				TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC18);
-				// Route CC2 to location 1 (PE3) and enable pin for cc2
-				TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-				TIMER_CompareBufSet(TIMER0, 2, 99);
-				TIMER0->CMD = TIMER_CMD_START;
-				previous_data=6;
-				    break;
-	case NO_GLOW:
-			CMU_ClockEnable(cmuClock_TIMER0, true);
-			CMU_ClockEnable(cmuClock_GPIO, true);
-							TIMER0->CMD = TIMER_CMD_STOP;
-							TIMER0->ROUTELOC0 = (TIMER0->ROUTELOC0&(~_TIMER_ROUTELOC0_CC2LOC_MASK))| (TIMER_ROUTELOC0_CC2LOC_LOC16);
-							// Route CC2 to location 1 (PE3) and enable pin for cc2
-							TIMER0->ROUTEPEN = TIMER0->ROUTEPEN | TIMER_ROUTEPEN_CC2PEN;
-							TIMER_CompareBufSet(TIMER0, 2, 100);
-							TIMER0->CMD = TIMER_CMD_START;
-							previous_data=1;
-							    break;
-	}
-	}
-
-}
-  if (lightbulb_state.onoff_current == request->on_off) {
-    printf("Request for current state received; no op\n");
-  } else {
-    printf("Turning lightbulb <%s>\r\n", request->on_off ? "ON" : "OFF");
-    if (transition_ms == 0 && delay_ms == 0) { // Immediate change
-      lightbulb_state.onoff_current = request->on_off;
-      lightbulb_state.onoff_target = request->on_off;
-      if (lightbulb_state.onoff_current == MESH_GENERIC_ON_OFF_STATE_OFF) {
-        LED_set_state(LED_STATE_OFF);
-      } else
-      {
-        LED_set_state(LED_STATE_ON);
-      }
-
-    } else {
-      // Current state remains as is for now
-      lightbulb_state.onoff_target = request->on_off;
-      LED_set_state(LED_STATE_TRANS); // set LEDs to transition mode
-      gecko_cmd_hardware_set_soft_timer(TIMER_MS_2_TIMERTICK(delay_ms + transition_ms), TIMER_ID_TRANSITION, 1);
-    }
-    lightbulb_state_store();
-  }
-
-  if (request_flags & MESH_REQUEST_FLAG_RESPONSE_REQUIRED) {
-    onoff_response(element_index, client_addr, appkey_index);
-  } else {
-    onoff_update(element_index);
-  }
-}
-
-static void onoff_change(uint16_t model_id,
-                         uint16_t element_index,
-                         const struct mesh_generic_state *current,
-                         const struct mesh_generic_state *target,
-                         uint32_t remaining_ms)
-{
-  // TODO
-}
-
-static errorcode_t power_onoff_response(uint16_t element_index,
-                                        uint16_t client_addr,
-                                        uint16_t appkey_index)
-{
-  struct mesh_generic_state current;
-  current.kind = mesh_generic_state_on_power_up;
-  current.on_power_up.on_power_up = lightbulb_state.onpowerup;
-
-  return mesh_lib_generic_server_response(MESH_GENERIC_POWER_ON_OFF_SERVER_MODEL_ID,
-                                          element_index,
-                                          client_addr,
-                                          appkey_index,
-                                          &current,
-                                          NULL,
-                                          0,
-                                          0x00);
-}
-
-static errorcode_t power_onoff_update(uint16_t element_index)
-{
-  struct mesh_generic_state current;
-  current.kind = mesh_generic_state_on_power_up;
-  current.on_power_up.on_power_up = lightbulb_state.onpowerup;
-
-  return mesh_lib_generic_server_update(MESH_GENERIC_POWER_ON_OFF_SERVER_MODEL_ID,
-                                        element_index,
-                                        &current,
-                                        NULL,
-                                        0);
-}
-
-static errorcode_t power_onoff_update_and_publish(uint16_t element_index)
-{
-  errorcode_t e;
-
-  e = power_onoff_update(element_index);
-  if (e == bg_err_success) {
-    e = mesh_lib_generic_server_publish(MESH_GENERIC_POWER_ON_OFF_SERVER_MODEL_ID,
-                                        element_index,
-                                        mesh_generic_state_on_power_up);
-  }
-
-  return e;
-}
-
-static void power_onoff_request(uint16_t model_id,
-                                uint16_t element_index,
-                                uint16_t client_addr,
-                                uint16_t server_addr,
-                                uint16_t appkey_index,
-                                const struct mesh_generic_request *request,
-                                uint32_t transition_ms,
-                                uint16_t delay_ms,
-                                uint8_t request_flags)
-{
-  printf("ON POWER UP request received; state=<%s>\n",
-         lightbulb_state.onpowerup == 0 ? "OFF"
-         : lightbulb_state.onpowerup == 1 ? "ON"
-         : "RESTORE");
-
-  if (lightbulb_state.onpowerup == request->on_power_up) {
-    printf("Request for current state received; no op\n");
-  } else {
-    printf("Setting onpowerup to <%s>\n",
-           request->on_power_up == 0 ? "OFF"
-           : request->on_power_up == 1 ? "ON"
-           : "RESTORE");
-    lightbulb_state.onpowerup = request->on_power_up;
-    lightbulb_state_store();
-  }
-
-  if (request_flags & MESH_REQUEST_FLAG_RESPONSE_REQUIRED) {
-    power_onoff_response(element_index, client_addr, appkey_index);
-  } else {
-    power_onoff_update(element_index);
-  }
-}
-
-static void power_onoff_change(uint16_t model_id,
-                               uint16_t element_index,
-                               const struct mesh_generic_state *current,
-                               const struct mesh_generic_state *target,
-                               uint32_t remaining_ms)
-{
-  // TODO
-}
-
-static errorcode_t transtime_response(uint16_t element_index,
-                                      uint16_t client_addr,
-                                      uint16_t appkey_index)
-{
-  struct mesh_generic_state current;
-  current.kind = mesh_generic_state_transition_time;
-  current.transition_time.time = lightbulb_state.transtime;
-
-  return mesh_lib_generic_server_response(MESH_GENERIC_TRANSITION_TIME_SERVER_MODEL_ID,
-                                          element_index,
-                                          client_addr,
-                                          appkey_index,
-                                          &current,
-                                          NULL,
-                                          0,
-                                          0x00);
-}
-
-static errorcode_t transtime_update(uint16_t element_index)
-{
-  struct mesh_generic_state current;
-  current.kind = mesh_generic_state_transition_time;
-  current.transition_time.time = lightbulb_state.transtime;
-
-  return mesh_lib_generic_server_update(MESH_GENERIC_TRANSITION_TIME_SERVER_MODEL_ID,
-                                        element_index,
-                                        &current,
-                                        NULL,
-                                        0);
-}
-
-static void transtime_request(uint16_t model_id,
-                              uint16_t element_index,
-                              uint16_t client_addr,
-                              uint16_t server_addr,
-                              uint16_t appkey_index,
-                              const struct mesh_generic_request *request,
-                              uint32_t transition_ms,
-                              uint16_t delay_ms,
-                              uint8_t request_flags)
-{
-  printf("TRANSTIME request received; state=<0x%x>\n",
-         lightbulb_state.transtime);
-
-  if (lightbulb_state.transtime == request->transition_time) {
-    printf("Request for current state received; no op\n");
-  } else {
-    printf("Setting transtime to <0x%x>\n", request->transition_time);
-    lightbulb_state.transtime = request->transition_time;
-    lightbulb_state_store();
-  }
-
-  if (request_flags & MESH_REQUEST_FLAG_RESPONSE_REQUIRED) {
-    transtime_response(element_index, client_addr, appkey_index);
-  } else {
-    transtime_update(element_index);
-  }
-}
-
-static void transtime_change(uint16_t model_id,
-                             uint16_t element_index,
-                             const struct mesh_generic_state *current,
-                             const struct mesh_generic_state *target,
-                             uint32_t remaining_ms)
-{
-  // TODO
-}
-
 /**
- * This function loads the saved light state from Persistent Storage and
- * copies the data in the global variable lightbulb_state
+ * This is a callback function that is invoked each time a GPIO interrupt in one of the pushbutton
+ * inputs occurs. Pin number is passed as parameter.
+ *
+ * Note: this function is called from ISR context and therefore it is not possible to call any BGAPI
+ * functions directly. The button state change is signaled to the application using gecko_external_signal()
+ * that will generate an event gecko_evt_system_external_signal_id which is then handled in the main loop.
  */
-static int lightbulb_state_load(void)
+void gpioint(uint8_t pin)
 {
-  struct gecko_msg_flash_ps_load_rsp_t* pLoad;
+  if (pin == BSP_GPIO_PB0_PIN) {
+    gecko_external_signal(0x1);
+  } else if (pin == BSP_GPIO_PB1_PIN) {
+    gecko_external_signal(0x2);
+  }
+}
 
-  pLoad = gecko_cmd_flash_ps_load(0x4004);
+/**
+ * Enable button interrupts for PB0, PB1. Both GPIOs are configured to trigger an interrupt on the
+ * rising edge (button released).
+ */
+void enable_button_interrupts(void)
+{
+  GPIOINT_Init();
 
-  if (pLoad->result) {
-    memset(&lightbulb_state, 0, sizeof(struct lightbulb_state));
-    return -1;
+  GPIO_ExtIntConfig(BSP_GPIO_PB0_PORT, BSP_GPIO_PB0_PIN, BSP_GPIO_PB0_PIN, true, false, true);
+  GPIO_ExtIntConfig(BSP_GPIO_PB1_PORT, BSP_GPIO_PB1_PIN, BSP_GPIO_PB1_PIN, true, false, true);
+
+  /* register the callback function that is invoked when interrupt occurs */
+  GPIOINT_CallbackRegister(BSP_GPIO_PB0_PIN, gpioint);
+  GPIOINT_CallbackRegister(BSP_GPIO_PB1_PIN, gpioint);
+}
+
+/**
+ * This function publishes one on/off request to change the state of light(s) in the group.
+ * Global variable switch_pos holds the latest desired light state, possible values are
+ * switch_pos = 1 -> PB1 was pressed, turn lights on
+ * switch_pos = 0 -> PB0 was pressed, turn lights off
+ *
+ * This application sends multiple requests for each button press to improve reliability.
+ * Parameter retrans indicates whether this is the first request or a re-transmission.
+ * The transaction ID is not incremented in case of a re-transmission.
+ */
+void send_onoff_request(int retrans)
+{
+  uint16 resp;
+  uint16 delay;
+  struct mesh_generic_request req;
+
+  req.kind = mesh_generic_request_on_off;
+  req.on_off = switch_pos;
+
+  // increment transaction ID for each request, unless it's a retransmission
+  if (retrans == 0) {
+    trid++;
   }
 
-  memcpy(&lightbulb_state, pLoad->value.data, pLoad->value.len);
+  /* delay for the request is calculated so that the last request will have a zero delay and each
+   * of the previous request have delay that increases in 50 ms steps. For example, when using three
+   * on/off requests per button press the delays are set as 100, 50, 0 ms
+   */
+  delay = (request_count - 1) * 50;
 
-  return 0;
-}
+  resp = gecko_cmd_mesh_generic_client_publish(
+    MESH_GENERIC_ON_OFF_CLIENT_MODEL_ID,
+    _my_index,
+    trid,
+    0,     // transition
+    delay,
+    0,     // flags
+    mesh_generic_request_on_off,     // type
+    1,     // param len
+    &req.on_off     /// parameters data
+    )->result;
 
-/**
- * this function saves the current light state in Persistent Storage so that
- * the data is preserved over reboots and power cycles. The light state is hold
- * in a global variable lightbulb_state. a PS key with ID 0x4004 is used to store
- * the whole struct.
- */
-static int lightbulb_state_store(void)
-{
-  struct gecko_msg_flash_ps_save_rsp_t* pSave;
+//  resp = gecko_cmd_mesh_generic_client_set(
+//    MESH_GENERIC_ON_OFF_CLIENT_MODEL_ID,
+//    _my_index, //client element index
+//    0x0002,    //server address -- the light address
+//    0,         //appkey index
+//    trid,      // tid
+//    0,     // transition
+//    delay,  //delay time
+//    1,     // flags
+//    mesh_generic_request_on_off,     // type
+//    1,     // param len
+//    &req.on_off     /// parameters data
+//    )->result;
 
-  pSave = gecko_cmd_flash_ps_save(0x4004, sizeof(struct lightbulb_state), (const uint8*)&lightbulb_state);
-
-  if (pSave->result) {
-    printf("lightbulb_state_store(): PS save failed, code %x\r\n", pSave->result);
-    return(-1);
+  if (resp) {
+    printf("gecko_cmd_mesh_generic_client_publish failed,code %x\r\n", resp);
+  } else {
+    printf("request sent, trid = %u, delay = %d\r\n", trid, delay);
   }
 
-  return 0;
+  /* keep track of how many requests has been sent */
+  if (request_count > 0) {
+    request_count--;
+  }
 }
 
 /**
- * Initialization of the models supported by this node. This function registeres callbacks for
- * each of the three supported models.
+ * Handling of button presses. This function called from the main loop when application receives
+ * event gecko_evt_system_external_signal_id.
+ *
+ * parameter button defines which button was pressed, possible values
+ * are 0 = PB0, 1 = PB1.
+ *
+ * This function is called from application context (not ISR) so it is safe to call BGAPI functions
  */
-static void init_models(void)
+void handle_button_press(int button)
 {
-  mesh_lib_generic_server_register_handler(MESH_GENERIC_ON_OFF_SERVER_MODEL_ID,
-                                           0,
-                                           onoff_request,
-                                           onoff_change);
-  mesh_lib_generic_server_register_handler(MESH_GENERIC_POWER_ON_OFF_SETUP_SERVER_MODEL_ID,
-                                           0,
-                                           power_onoff_request,
-                                           power_onoff_change);
-  mesh_lib_generic_server_register_handler(MESH_GENERIC_TRANSITION_TIME_SERVER_MODEL_ID,
-                                           0,
-                                           transtime_request,
-                                           transtime_change);
+  // PB0 -> switch off, PB1 -> switch on
+  switch_pos = button;
+
+  printf("PB%d -> turn light(s) ", button);
+  if (switch_pos) {
+    printf("on\r\n");
+  } else {
+    printf("off\r\n");
+  }
+  request_count = 3; // request is sent 3 times to improve reliability
+
+  /* send the first request */
+  send_onoff_request(0);
+
+  /* start a repeating soft timer to trigger re-transmission of the request after 50 ms delay */
+  gecko_cmd_hardware_set_soft_timer(TIMER_MS_2_TIMERTICK(50), TIMER_ID_RETRANS, 0);
 }
 
 /**
- * Light node initialization. This is called at each boot if provisioning is already done.
+ * Switch node initialization. This is called at each boot if provisioning is already done.
  * Otherwise this function is called after provisioning is completed.
  */
-void lightbulb_state_init(void)
+void switch_node_init(void)
 {
-  /* Initialize mesh lib */
   mesh_lib_init(malloc, free, 8);
-
-  memset(&lightbulb_state, 0, sizeof(struct lightbulb_state));
-  if (lightbulb_state_load() != 0) {
-    printf("lightbulb_state_load() failed, using defaults\r\n");
-    goto publish;
-  }
-
-  // Handle on power up behavior
-  switch (lightbulb_state.onpowerup) {
-    case MESH_GENERIC_ON_POWER_UP_STATE_OFF:
-      printf("On power up state is OFF\r\n");
-      lightbulb_state.onoff_current = MESH_GENERIC_ON_OFF_STATE_OFF;
-      lightbulb_state.onoff_target = MESH_GENERIC_ON_OFF_STATE_OFF;
-      LED_set_state(LED_STATE_OFF);
-      break;
-    case MESH_GENERIC_ON_POWER_UP_STATE_ON:
-      printf("On power up state is ON\r\n");
-      lightbulb_state.onoff_current = MESH_GENERIC_ON_OFF_STATE_ON;
-      lightbulb_state.onoff_target = MESH_GENERIC_ON_OFF_STATE_ON;
-      LED_set_state(LED_STATE_ON);
-      break;
-    case MESH_GENERIC_ON_POWER_UP_STATE_RESTORE:
-      printf("On power up state is RESTORE\r\n");
-      if (lightbulb_state.onoff_current != lightbulb_state.onoff_target) {
-        uint32_t transition_ms = default_transition_time();
-
-        printf("Starting on power up transition\r\n");
-        LED_set_state(LED_STATE_TRANS);
-        gecko_cmd_hardware_set_soft_timer(TIMER_MS_2_TIMERTICK(transition_ms), TIMER_ID_TRANSITION, 1);
-      } else {
-        printf("Keeping loaded state\r\n");
-        if (lightbulb_state.onoff_current == MESH_GENERIC_ON_OFF_STATE_OFF) {
-          LED_set_state(LED_STATE_OFF);
-        } else {
-          LED_set_state(LED_STATE_ON);
-        }
-      }
-      break;
-  }
-
-  lightbulb_state_store();
-
-  publish:
-  init_models();
-  onoff_update_and_publish(_my_index);
-  power_onoff_update_and_publish(_my_index);
 }
 
 static void handle_gecko_event(uint32_t evt_id, struct gecko_cmd_packet *evt);
@@ -998,7 +420,7 @@ void set_device_name(bd_addr *pAddr)
   uint16 res;
 
   // create unique device name using the last two bytes of the Bluetooth address
-  sprintf(name, "light node %x:%x", pAddr->addr[1], pAddr->addr[0]);
+  sprintf(name, "switch node %x:%x", pAddr->addr[1], pAddr->addr[0]);
 
   printf("Device name: '%s'\r\n", name);
 
@@ -1009,26 +431,6 @@ void set_device_name(bd_addr *pAddr)
 
   // show device name on the LCD
   LCD_write(name, LCD_ROW_NAME);
-}
-
-/**
- * This function is called when a light on/off transition has completed
- */
-void transition_complete()
-{
-  // transition done -> set state, update and publish
-  lightbulb_state.onoff_current = lightbulb_state.onoff_target;
-
-  printf("transition complete. New state is %s\r\n", lightbulb_state.onoff_current ? "ON" : "OFF");
-
-  if (lightbulb_state.onoff_current == MESH_GENERIC_ON_OFF_STATE_OFF) {
-    LED_set_state(LED_STATE_OFF);
-  } else {
-    LED_set_state(LED_STATE_ON);
-  }
-
-  lightbulb_state_store();
-  onoff_update_and_publish(_my_index);
 }
 
 /**
@@ -1061,7 +463,6 @@ int main()
   MX25_DP();
   /* We must disable SPI communication */
   USART_Reset(USART1);
-
 #endif /* FEATURE_SPI_FLASH */
 
   enter_DefaultMode_from_RESET();
@@ -1078,8 +479,6 @@ int main()
 
   RETARGET_SerialInit();
 
-  timer_init();
-  TIMER0->CMD = TIMER_CMD_STOP;
   /* initialize LEDs and buttons. Note: some radio boards share the same GPIO for button & LED.
    * Initialization is done in this order so that default configuration will be "button" for those
    * radio boards with shared pins. led_init() is called later as needed to (re)initialize the LEDs
@@ -1089,81 +488,7 @@ int main()
 
   LCD_init();
 
-
-//  for(int i=0;i<1000000;i++)
-//   {
-//
-// 	  TIMER_CompareBufSet(TIMER0, 2, 70);
-//   }
-//
-//  for(int i=0;i<1000000;i++)
-//   {
-//
-// 	  TIMER_CompareBufSet(TIMER0, 2, 60);
-//   }
-//
-//  for(int i=0;i<1000000;i++)
-//   {
-//
-// 	  TIMER_CompareBufSet(TIMER0, 2, 50);
-//   }
-//
-//  for(int i=0;i<1000000;i++)
-//   {
-//
-// 	  TIMER_CompareBufSet(TIMER0, 2, 40);
-//   }
-//  for(int i=0;i<1000000;i++)
-//   {
-//
-// 	  TIMER_CompareBufSet(TIMER0, 2, 30);
-//   }
-//  for(int i=0;i<1000000;i++)
-//   {
-//
-// 	  TIMER_CompareBufSet(TIMER0, 2, 20);
-//   }
-//  for(int i=0;i<1000000;i++)
-//   {
-//
-// 	  TIMER_CompareBufSet(TIMER0, 2, 10);
-//   }
-//  for(int i=0;i<1000000;i++)
-//   {
-//
-// 	  TIMER_CompareBufSet(TIMER0, 2, 20);
-//   }
-
-  GPIO_PinModeSet(RED_LED,RED_LED_PIN,gpioModePushPull,1);
-  GPIO_PinModeSet(GREEN_LED,GREEN_LED_PIN,gpioModePushPull,1);
-  GPIO_PinModeSet(BLUE_LED,BLUE_LED_PIN,gpioModePushPull,1);
-
-
-  GPIO_PinOutSet(BLUE_LED,BLUE_LED_PIN);
-
-
-//GPIO_PinOutSet(BLUE_LED,BLUE_LED_PIN);
-
-//GPIO_PinOutSet(RED_LED,RED_LED_PIN);
-//for(int i=0;i<10000000;i++)
-//{
-//	GPIO_PinOutClear(RED_LED,RED_LED_PIN);
-//
-//}
-GPIO_PinOutSet(RED_LED,RED_LED_PIN);
-
-//GPIO_PinOutSet(GREEN_LED,GREEN_LED_PIN);
-//for(int i=0;i<10000000;i++)
-//{
-//	GPIO_PinOutClear(GREEN_LED,GREEN_LED_PIN);
-//
-//}
-GPIO_PinOutSet(GREEN_LED,GREEN_LED_PIN);
-
-
-
   while (1) {
-
     struct gecko_cmd_packet *evt = gecko_wait_event();
     handle_gecko_event(BGLIB_MSG_ID(evt->header), evt);
   }
@@ -1175,7 +500,6 @@ GPIO_PinOutSet(GREEN_LED,GREEN_LED_PIN);
 static void handle_gecko_event(uint32_t evt_id, struct gecko_cmd_packet *evt)
 {
   struct gecko_bgapi_mesh_node_cmd_packet *node_evt;
-  struct gecko_bgapi_mesh_generic_server_cmd_packet *server_evt;
   struct gecko_msg_mesh_node_provisioning_failed_evt_t  *prov_fail_evt;
 
   if (NULL == evt) {
@@ -1192,13 +516,12 @@ static void handle_gecko_event(uint32_t evt_id, struct gecko_cmd_packet *evt)
 
         set_device_name(&pAddr->address);
         gecko_cmd_system_set_tx_power(-260);
-
         // Initialize Mesh stack in Node operation mode, wait for initialized event
         gecko_cmd_mesh_node_init_oob(0x00,0x02,0x03,0x04,0x04,0x04,0x01);
-        //gecko_cmd_mesh_node_init();
 
-        // re-initialize LEDs (needed for those radio board that share same GPIO for button/LED)
-        led_init();
+     //   gecko_cmd_mesh_node_init();
+
+
       }
       break;
 
@@ -1216,9 +539,12 @@ static void handle_gecko_event(uint32_t evt_id, struct gecko_cmd_packet *evt)
           LED_set_state(LED_STATE_PROV);
           break;
 
-        case TIMER_ID_TRANSITION:
-          /* light state transition has completed */
-          transition_complete();
+        case TIMER_ID_RETRANS:
+          send_onoff_request(1);   // param 1 indicates that this is a retransmission
+          // stop retransmission timer if it was the last attempt
+          if (request_count == 0) {
+            gecko_cmd_hardware_set_soft_timer(0, TIMER_ID_RETRANS, 0);
+          }
           break;
 
         default:
@@ -1226,6 +552,26 @@ static void handle_gecko_event(uint32_t evt_id, struct gecko_cmd_packet *evt)
       }
 
       break;
+
+      case gecko_evt_mesh_node_display_output_oob_id:
+
+        {
+             struct gecko_msg_mesh_node_display_output_oob_evt_t *pOOB = (struct gecko_msg_mesh_node_display_output_oob_evt_t *)&(evt->data);
+             printf("gecko_msg_mesh_node_display_output_oob_evt_t: action %d, size %d\r\n", pOOB->output_action, pOOB->output_size);
+             for(int i=0;i<pOOB->data.len;i++)
+             {
+                 printf("%2.2x ", pOOB->data.data[i]);
+             }
+             Auth_code |= pOOB->data.data[14];
+             Auth_code = Auth_code<<8;
+             Auth_code |= pOOB->data.data[15];
+             sprintf(temp, "Auth code %d",Auth_code);
+
+             LCD_write(temp,LCD_ROW_AUTH_CODE);
+
+         }
+         break;
+
 
     case gecko_evt_mesh_node_initialized_id:
       printf("node initialized\r\n");
@@ -1237,9 +583,10 @@ static void handle_gecko_event(uint32_t evt_id, struct gecko_cmd_packet *evt)
 
         _my_address = pData->address;
         _my_index = 0;   // index of primary element hardcoded to zero in this example
-        lightbulb_state_init();
 
-        printf("Light initial state is <%s>\r\n", lightbulb_state.onoff_current ? "ON" : "OFF");
+        enable_button_interrupts();
+        switch_node_init();
+
         LCD_write("provisioned", LCD_ROW_STATUS);
       } else {
         printf("node is unprovisioned\r\n");
@@ -1250,40 +597,40 @@ static void handle_gecko_event(uint32_t evt_id, struct gecko_cmd_packet *evt)
       }
       break;
 
+    case gecko_evt_system_external_signal_id:
+    {
+      if (evt->data.evt_system_external_signal.extsignals & 0x1) {
+        handle_button_press(0);
+      }
+      if (evt->data.evt_system_external_signal.extsignals & 0x2) {
+        handle_button_press(1);
+      }
+    }
+    break;
+
     case gecko_evt_mesh_node_provisioning_started_id:
       printf("Started provisioning\r\n");
       LCD_write("provisioning...", LCD_ROW_STATUS);
+#ifdef FEATURE_LED_BUTTON_ON_SAME_PIN
+      led_init(); /* shared GPIO pins used as LED output */
+#endif
       // start timer for blinking LEDs to indicate which node is being provisioned
       gecko_cmd_hardware_set_soft_timer(32768 / 4, TIMER_ID_PROVISIONING, 0);
       break;
 
-
-    case gecko_evt_mesh_node_display_output_oob_id:
-
-    {
-         struct gecko_msg_mesh_node_display_output_oob_evt_t *pOOB = (struct gecko_msg_mesh_node_display_output_oob_evt_t *)&(evt->data);
-         printf("gecko_msg_mesh_node_display_output_oob_evt_t: action %d, size %d\r\n", pOOB->output_action, pOOB->output_size);
-         for(int i=0;i<pOOB->data.len;i++)
-         {
-             printf("%2.2x ", pOOB->data.data[i]);
-         }
-         Auth_code |= pOOB->data.data[14];
-         Auth_code = Auth_code<<8;
-         Auth_code |= pOOB->data.data[15];
-         sprintf(temp, "Auth code %d",Auth_code);
-         LCD_write(temp,LCD_ROW_AUTH_CODE);
-
-         printf("\r\n");
-     }
-     break;
     case gecko_evt_mesh_node_provisioned_id:
       _my_index = 0;   // index of primary element hardcoded to zero in this example
-      lightbulb_state_init();
+      switch_node_init();
       printf("node provisioned, got index=%x\r\n", _my_index);
       // stop LED blinking when provisioning complete
       gecko_cmd_hardware_set_soft_timer(0, TIMER_ID_PROVISIONING, 0);
       LED_set_state(LED_STATE_OFF);
       LCD_write("provisioned", LCD_ROW_STATUS);
+
+#ifdef FEATURE_LED_BUTTON_ON_SAME_PIN
+      button_init(); /* shared GPIO pins used as button input */
+#endif
+      enable_button_interrupts();
       break;
 
     case gecko_evt_mesh_node_provisioning_failed_id:
@@ -1304,32 +651,11 @@ static void handle_gecko_event(uint32_t evt_id, struct gecko_cmd_packet *evt)
       printf("model config changed\r\n");
       break;
 
-    case gecko_evt_mesh_generic_server_client_request_id:
-      printf("evt gecko_evt_mesh_generic_server_client_request_id\r\n");
-      server_evt = (struct gecko_bgapi_mesh_generic_server_cmd_packet *)evt;
-      mesh_lib_generic_server_event_handler(server_evt);
-      break;
-
-    case gecko_evt_mesh_node_reset_id:
-      printf("evt gecko_evt_mesh_node_reset_id\r\n");
-      initiate_factory_reset();
-      break;
-
-    // just for debugging...
-    case gecko_evt_le_gap_adv_timeout_id:
-    case gecko_evt_le_gap_bt5_adv_timeout_id:
-      // adv timeout events silently discarded
-      break;
-
     case gecko_evt_le_connection_bt5_opened_id:
       printf("evt:gecko_evt_le_connection_bt5_opened_id\r\n");
       num_connections++;
       conn_handle = evt->data.evt_le_connection_bt5_opened.connection;
       LCD_write("connected", LCD_ROW_CONNECTION);
-      break;
-
-    case gecko_evt_le_connection_parameters_id:
-      printf("evt:gecko_evt_le_connection_parameters_id\r\n");
       break;
 
     case gecko_evt_le_connection_closed_id:
@@ -1340,6 +666,17 @@ static void handle_gecko_event(uint32_t evt_id, struct gecko_cmd_packet *evt)
           LCD_write("", LCD_ROW_CONNECTION);
         }
       }
+      break;
+
+    case gecko_evt_mesh_node_reset_id:
+      printf("evt gecko_evt_mesh_node_reset_id\r\n");
+      initiate_factory_reset();
+      break;
+
+    case gecko_evt_le_gap_adv_timeout_id:
+    case gecko_evt_le_gap_bt5_adv_timeout_id:
+    case gecko_evt_le_connection_parameters_id:
+      // these events silently discarded
       break;
 
     default:
